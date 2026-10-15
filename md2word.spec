@@ -5,6 +5,21 @@
 产物：  dist/Markdown转Word批量转换器.exe
 """
 
+import os
+import shutil
+
+
+PANDOC_EXE = shutil.which('pandoc')
+if not PANDOC_EXE:
+    raise SystemExit('打包失败：未找到 pandoc，无法生成免安装版本。')
+PANDOC_DIR = os.path.dirname(PANDOC_EXE)
+
+PANDOC_DATAS = []
+for filename in ('COPYING.rtf', 'COPYRIGHT.txt'):
+    path = os.path.join(PANDOC_DIR, filename)
+    if os.path.isfile(path):
+        PANDOC_DATAS.append((path, 'pandoc'))
+
 # 运行期完全用不到的大体积第三方库，剔除后能显著压缩产物体积。
 EXCLUDES = [
     # 科学计算 / 机器学习
@@ -27,11 +42,11 @@ EXCLUDES = [
 a = Analysis(
     ['md2word.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(PANDOC_EXE, 'pandoc')],
     datas=[
         ('logo/logo.ico', 'logo'),
         ('logo/logo.png', 'logo'),
-    ],
+    ] + PANDOC_DATAS,
     hiddenimports=['wx.dataview'],
     hookspath=[],
     hooksconfig={},

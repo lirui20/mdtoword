@@ -20,14 +20,14 @@
 | 依赖 | 说明 |
 | --- | --- |
 | Windows | 剪贴板富文本、打开目录等按 Windows 实现；其它平台可运行但未验证 |
-| [pandoc](https://pandoc.org/installing.html) | **必需**。转换后端完全依赖它，请确保 `pandoc` 在 `PATH` 中 |
-| Python 3.x + wxPython | 仅在从源码运行时需要；用打包好的 exe 则不需要 |
+| [pandoc](https://pandoc.org/installing.html) | 仅从源码运行时需要；打包版已经内置 |
+| Python 3.x + wxPython | 仅从源码运行时需要；用打包好的 exe 则不需要 |
 
 ## 使用方式
 
 ### 直接使用打包好的 exe
 
-运行 `dist/Markdown转Word批量转换器.exe`。注意 exe **不包含 pandoc**，目标机器仍需自行安装 pandoc。
+运行 `dist/Markdown转Word批量转换器.exe`。程序已经内置 pandoc，目标机器无需安装 pandoc，也无需配置 PATH。
 
 ### 从源码运行
 
@@ -42,7 +42,7 @@ python md2word.py
 pyinstaller --noconfirm md2word.spec
 ```
 
-产物为 `dist/Markdown转Word批量转换器.exe`（单文件、无控制台）。`md2word.spec` 已排除 numpy、torch、tensorflow、PyQt、jupyter 等运行期用不到的库，产物约 17 MB。
+产物为 `dist/Markdown转Word批量转换器.exe`（单文件、无控制台、内置 pandoc）。`md2word.spec` 已排除 numpy、torch、tensorflow、PyQt、jupyter 等运行期用不到的库。
 
 ## 界面说明
 
@@ -81,5 +81,5 @@ test.md / test.docx    转换效果样例
 
 ## 已知限制
 
-- 依赖外部 `pandoc`，未随程序分发
+- 单文件版内置 pandoc，文件体积会比不内置时明显增大
 - 未在 macOS / Linux 上验证

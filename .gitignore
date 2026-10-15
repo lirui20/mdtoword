@@ -8,6 +8,8 @@ venv/
 # PyInstaller 构建产物
 build/
 dist/
+build-portable/
+dist-portable/
 
 # 本机工具目录
 .reasonix/
@@ -17,3 +19,7 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 本机临时 / 归档产物
+~$*
+*.zip
