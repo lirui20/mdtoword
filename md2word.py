@@ -6,7 +6,7 @@ md2word.py —— 图形化将 Markdown 批量转换为 Word (.docx) 文档
 依赖：
     - Python 3.x
     - wxPython  (pip install wxPython)
-    - pandoc    (https://pandoc.org/installing.html)
+    - pandoc    (源码运行时需要；打包版已内置)
 
 运行：
     python md2word.py
@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zipfile
 
 import wx
 import wx.dataview
@@ -403,19 +404,108 @@ local function build_numbered(math, tag)
     { pandoc.AlignCenter, 0.84 },
     { pandoc.AlignRight,  0.08 },
   }
+  tbl.attr = pandoc.Attr("", { "md2word-equation" })
   return tbl
 end
 
-function Para(el)
-  if #el.content == 1 and el.content[1].t == "Math"
-     and el.content[1].mathtype == "DisplayMath" then
-    local m = el.content[1]
-    local tag = m.text:match("\\tag%s*{([^}]*)}")
-    if tag then
-      return build_numbered(m, tag)
-    end
+local function trim_inline_whitespace(inlines)
+  while #inlines > 0 and
+        (inlines[1].t == "Space" or inlines[1].t == "SoftBreak" or
+         inlines[1].t == "LineBreak") do
+    table.remove(inlines, 1)
+  end
+  while #inlines > 0 and
+        (inlines[#inlines].t == "Space" or inlines[#inlines].t == "SoftBreak" or
+         inlines[#inlines].t == "LineBreak") do
+    table.remove(inlines)
+  end
+end
+
+local function normalize_math_text(text)
+  -- 兼容 AI/富文本编辑器常见的重复数学定界：$\(...\)$、$$\[...\]$$。
+  -- Pandoc 已经根据外层 $ 生成 Math 节点，内层定界符必须去掉。
+  local inner = text:match("^%s*\\%((.-)\\%)%s*$")
+  if not inner then
+    inner = text:match("^%s*\\%[(.-)\\%]%s*$")
+  end
+  if inner then
+    text = inner
+  end
+
+  -- Markdown 转义有时会被带进公式，例如 \sum\_{i=1}^n；在数学环境中
+  -- “下划线 + 花括号”应当是下标，而不是字面下划线。
+  text = text:gsub("\\_(%b{})", "_%1")
+  return text
+end
+
+function Math(el)
+  local normalized = normalize_math_text(el.text)
+  if normalized ~= el.text then
+    el.text = normalized
+    return el
   end
   return nil
+end
+
+function Para(el)
+  -- Pandoc 允许 $$...$$ 与普通文字处于同一段。旧逻辑只处理“整段仅有
+  -- 一个公式”的情况，导致“前文 $$...\tag{1}$$ 后文”中的 \tag 未被移除。
+  -- 这里把这种混合段落拆成前文、编号公式表格、后文三个块。
+  local blocks = {}
+  local pending = {}
+  local found = false
+
+  local function flush_pending()
+    trim_inline_whitespace(pending)
+    if #pending > 0 then
+      table.insert(blocks, pandoc.Para(pending))
+    end
+    pending = {}
+  end
+
+  for _, inline in ipairs(el.content) do
+    if inline.t == "Math" and inline.mathtype == "DisplayMath" then
+      local tag = inline.text:match("\\tag%s*{([^}]*)}")
+      if tag then
+        flush_pending()
+        table.insert(blocks, build_numbered(inline, tag))
+        found = true
+      else
+        table.insert(pending, inline)
+      end
+    else
+      table.insert(pending, inline)
+    end
+  end
+
+  if found then
+    flush_pending()
+    return blocks
+  end
+  return nil
+end
+
+function CodeBlock(el)
+  -- 常见 AI/编辑器会用 ```math ... ``` 表示公式，但 Pandoc 默认把它当
+  -- 代码块。将 class=math 的围栏代码块显式提升为 DisplayMath。
+  local is_math = false
+  for _, class in ipairs(el.classes) do
+    if class == "math" then
+      is_math = true
+      break
+    end
+  end
+  if not is_math then
+    return nil
+  end
+
+  local text = normalize_math_text(el.text):gsub("^%s+", ""):gsub("%s+$", "")
+  local math = pandoc.Math("DisplayMath", text)
+  local tag = text:match("\\tag%s*{([^}]*)}")
+  if tag then
+    return build_numbered(math, tag)
+  end
+  return pandoc.Para({ math })
 end
 """
 
@@ -433,7 +523,10 @@ def resource_path(rel):
 
 
 def find_pandoc():
-    """在 PATH 及常见安装目录中查找 pandoc 可执行文件。"""
+    """优先使用打包内置的 pandoc，再查找系统安装。"""
+    bundled = resource_path(os.path.join("pandoc", "pandoc.exe"))
+    if os.path.isfile(bundled):
+        return bundled
     p = shutil.which("pandoc")
     if p:
         return p
@@ -529,6 +622,162 @@ def _merge_html_docs(docs):
             + "</head><body>" + sep.join(parts) + "</body></html>")
 
 
+def _normalize_equation_tables_html(html_doc):
+    """固定富文本中公式编号表的宽度、边距及水平/垂直对齐。"""
+    table_re = re.compile(
+        r'(?is)<table(?P<attrs>[^>]*\bclass="[^"]*\bmd2word-equation\b[^"]*"[^>]*)>'
+        r'(?P<body>.*?)</table>')
+
+    def fix_table(match):
+        attrs = match.group("attrs")
+        body = match.group("body")
+        style_match = re.search(r'(?is)\bstyle="([^"]*)"', attrs)
+        forced = ("width:100%;table-layout:fixed;border-collapse:collapse;"
+                  "margin-left:0;margin-right:0")
+        if style_match:
+            old = re.sub(
+                r'(?i)(?:width|table-layout|border-collapse|margin-left|margin-right)'
+                r'\s*:[^;]+;?', "", style_match.group(1)).rstrip("; ")
+            style = (old + ";" if old else "") + forced
+            attrs = (attrs[:style_match.start()] + 'style="' + style + '"'
+                     + attrs[style_match.end():])
+        else:
+            attrs += ' style="' + forced + '"'
+
+        cells = list(re.finditer(r'(?is)<td(?P<attrs>[^>]*)>', body))
+        aligns = ("left", "center", "right")
+        for i, cell in reversed(list(enumerate(cells[:3]))):
+            cell_attrs = cell.group("attrs")
+            css = "padding:0;vertical-align:middle;text-align:%s" % aligns[i]
+            sm = re.search(r'(?is)\bstyle="([^"]*)"', cell_attrs)
+            if sm:
+                old = re.sub(r'(?i)(?:padding|vertical-align|text-align)\s*:[^;]+;?',
+                             "", sm.group(1)).rstrip("; ")
+                new_style = (old + ";" if old else "") + css
+                cell_attrs = (cell_attrs[:sm.start()] + 'style="' + new_style + '"'
+                              + cell_attrs[sm.end():])
+            else:
+                cell_attrs += ' style="' + css + '"'
+            body = body[:cell.start()] + "<td" + cell_attrs + ">" + body[cell.end():]
+        return "<table" + attrs + ">" + body + "</table>"
+
+    return table_re.sub(fix_table, html_doc)
+
+
+def _normalize_equation_tables_docx(path):
+    """强制编号公式表在 Word/WPS 中按正文宽度精确对齐。
+
+    Pandoc 会生成正确的三列比例，但参考文档中的 Table 样式仍可能注入表格
+    缩进、单元格边距或顶部对齐。本函数只修改“中间含 OMML、右侧为编号”的
+    单行三列表格，不碰用户自己的普通表格。
+    """
+    with zipfile.ZipFile(path, "r") as zin:
+        infos = zin.infolist()
+        files = {info.filename: zin.read(info.filename) for info in infos}
+
+    name = "word/document.xml"
+    raw = files.get(name)
+    if not raw:
+        return 0
+    xml = raw.decode("utf-8")
+    changed = 0
+
+    def force_ppr(cell, align):
+        def update(match):
+            ppr = match.group(0)
+            ppr = re.sub(r'<w:jc\b[^>]*/>', "", ppr)
+            ppr = re.sub(r'<w:ind\b[^>]*/>', "", ppr)
+            ppr = re.sub(r'<w:spacing\b[^>]*/>', "", ppr)
+            forced = ('<w:jc w:val="%s" />'
+                      '<w:ind w:left="0" w:right="0" w:firstLine="0" />'
+                      '<w:spacing w:before="0" w:after="0" />') % align
+            return ppr.replace("<w:pPr>", "<w:pPr>" + forced, 1)
+
+        if re.search(r'<w:pPr\s*/>', cell):
+            forced = ('<w:pPr><w:jc w:val="%s" />'
+                      '<w:ind w:left="0" w:right="0" w:firstLine="0" />'
+                      '<w:spacing w:before="0" w:after="0" /></w:pPr>') % align
+            return re.sub(r'<w:pPr\s*/>', forced, cell, count=1)
+        if "<w:pPr>" in cell:
+            return re.sub(r'<w:pPr>.*?</w:pPr>', update, cell,
+                          count=1, flags=re.S)
+        return cell.replace("<w:p>",
+                            '<w:p><w:pPr><w:jc w:val="%s" />'
+                            '<w:ind w:left="0" w:right="0" w:firstLine="0" />'
+                            '<w:spacing w:before="0" w:after="0" />'
+                            '</w:pPr>' % align, 1)
+
+    def force_cell(cell, width, align):
+        props = ('<w:tcW w:w="%d" w:type="pct" />'
+                 '<w:vAlign w:val="center" />') % width
+        if re.search(r'<w:tcPr\s*/>', cell):
+            cell = re.sub(r'<w:tcPr\s*/>', '<w:tcPr>' + props + '</w:tcPr>',
+                          cell, count=1)
+        elif "<w:tcPr>" in cell:
+            cell = re.sub(r'<w:tcW\b[^>]*/>|<w:vAlign\b[^>]*/>', "", cell)
+            cell = cell.replace("<w:tcPr>", "<w:tcPr>" + props, 1)
+        else:
+            cell = cell.replace("<w:tc>", "<w:tc><w:tcPr>" + props + "</w:tcPr>", 1)
+        return force_ppr(cell, align)
+
+    def fix_table(match):
+        nonlocal changed
+        table = match.group(0)
+        cells = re.findall(r'<w:tc>.*?</w:tc>', table, flags=re.S)
+        if (len(cells) != 3 or "<m:oMath" not in cells[1] or
+                not re.search(r'<w:t[^>]*>\s*\([^<]+\)\s*</w:t>', cells[2])):
+            return table
+
+        tbl_props = (
+            '<w:tblW w:w="5000" w:type="pct" />'
+            '<w:jc w:val="center" />'
+            '<w:tblInd w:w="0" w:type="dxa" />'
+            '<w:tblLayout w:type="fixed" />'
+            '<w:tblCellMar>'
+            '<w:top w:w="0" w:type="dxa" />'
+            '<w:left w:w="0" w:type="dxa" />'
+            '<w:bottom w:w="0" w:type="dxa" />'
+            '<w:right w:w="0" w:type="dxa" />'
+            '</w:tblCellMar>')
+        def clean_tblpr(tblpr_match):
+            inner = tblpr_match.group(0)[9:-10]
+            for prop in ("tblW", "jc", "tblInd", "tblLayout", "tblCellMar"):
+                inner = re.sub(
+                    r'<w:%s\b[^>]*/>|<w:%s\b[^>]*>.*?</w:%s>' %
+                    (prop, prop, prop), "", inner, flags=re.S)
+            return '<w:tblPr>' + tbl_props + inner + '</w:tblPr>'
+
+        table = re.sub(r'<w:tblPr>.*?</w:tblPr>', clean_tblpr,
+                       table, count=1, flags=re.S)
+
+        old_cells = re.findall(r'<w:tc>.*?</w:tc>', table, flags=re.S)
+        new_cells = [
+            force_cell(old_cells[0], 400, "left"),
+            force_cell(old_cells[1], 4200, "center"),
+            force_cell(old_cells[2], 400, "right"),
+        ]
+        for old, new in zip(old_cells, new_cells):
+            table = table.replace(old, new, 1)
+        changed += 1
+        return table
+
+    xml = re.sub(r'<w:tbl>.*?</w:tbl>', fix_table, xml, flags=re.S)
+    if not changed:
+        return 0
+    files[name] = xml.encode("utf-8")
+
+    tmp = path + ".layout.tmp"
+    try:
+        with zipfile.ZipFile(tmp, "w") as zout:
+            for info in infos:
+                zout.writestr(info, files[info.filename])
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return changed
+
+
 # --------------------------------------------------------------------------- #
 # 主窗口
 # --------------------------------------------------------------------------- #
@@ -547,11 +796,12 @@ class MainFrame(wx.Frame):
         self.Centre()
 
         if not self.pandoc:
-            self.log("✗ 未找到 pandoc，请先安装：https://pandoc.org/installing.html",
+            self.log("✗ 未找到 pandoc；源码运行请先安装，打包版请重新下载完整程序。",
                      COL_STATUS_ERR)
             wx.MessageBox(
                 "未检测到 pandoc，转换功能不可用。\n"
-                "请先安装 pandoc 并确保它在系统 PATH 中，然后重启本程序。",
+                "若从源码运行，请安装 pandoc 并加入系统 PATH；\n"
+                "若使用打包版，请重新下载完整的程序文件。",
                 "缺少 pandoc", wx.OK | wx.ICON_ERROR)
 
     # ------------------------------------------------------------------ UI --
@@ -957,7 +1207,7 @@ class MainFrame(wx.Frame):
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(err or ("pandoc 返回 %d" % proc.returncode))
-        return proc.stdout
+        return _normalize_equation_tables_html(proc.stdout)
 
     def _start_rich_copy(self, sources, cleanup_dir=None, button=None):
         opts = self._common_pandoc_opts()
@@ -1239,10 +1489,19 @@ class MainFrame(wx.Frame):
                 continue
 
             if proc.returncode == 0 and os.path.isfile(dst):
-                ok += 1
-                outputs.append(dst)
-                wx.CallAfter(self._set_status, idx, "成功", T.OK)
-                self.log("✓ %s → %s" % (os.path.basename(src), os.path.basename(dst)), COL_STATUS_OK)
+                try:
+                    _normalize_equation_tables_docx(dst)
+                except Exception as ex:
+                    fail += 1
+                    wx.CallAfter(self._set_status, idx, "失败", T.ERR)
+                    self.log("✗ %s：公式版式修正失败：%s" %
+                             (os.path.basename(src), ex), COL_STATUS_ERR)
+                else:
+                    ok += 1
+                    outputs.append(dst)
+                    wx.CallAfter(self._set_status, idx, "成功", T.OK)
+                    self.log("✓ %s → %s" %
+                             (os.path.basename(src), os.path.basename(dst)), COL_STATUS_OK)
             else:
                 fail += 1
                 wx.CallAfter(self._set_status, idx, "失败", T.ERR)
@@ -1288,5 +1547,32 @@ def main():
     app.MainLoop()
 
 
+def _self_test_pandoc():
+    """供打包验收使用：用内置 pandoc 实际生成一个临时 DOCX。"""
+    pandoc = find_pandoc()
+    if not pandoc:
+        return 2
+    kwargs = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        with tempfile.TemporaryDirectory(prefix="md2word_selftest_") as tmpdir:
+            src = os.path.join(tmpdir, "input.md")
+            dst = os.path.join(tmpdir, "output.docx")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("# Pandoc self test\n\n$y = ax + b$\n")
+            proc = subprocess.run([pandoc, src, "-o", dst, "--standalone"],
+                                  capture_output=True, timeout=30, **kwargs)
+            if proc.returncode != 0 or not os.path.isfile(dst):
+                return 4
+            if os.path.getsize(dst) < 1000:
+                return 5
+    except Exception:
+        return 3
+    return 0
+
+
 if __name__ == "__main__":
+    if "--self-test-pandoc" in sys.argv:
+        sys.exit(_self_test_pandoc())
     main()
